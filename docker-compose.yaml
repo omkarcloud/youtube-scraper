@@ -1,0 +1,10 @@
+services:
+  youtube-scraper:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      # Optional — only if you see HTTP 429 or bot checks at high volume.
+      # - YOUTUBE_PROXY=http://user:pass@host:port
