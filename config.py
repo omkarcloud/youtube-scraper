@@ -36,5 +36,15 @@ def youtube_proxy():
     return os.environ.get("YOUTUBE_PROXY") or None
 
 
-def youtube_fallback_proxy():
+def youtube_fallback_proxy(*args, **kwargs):
     return os.environ.get("YOUTUBE_PROXY") or None
+
+
+# ---- added by the sync: defaults for a direct run ----
+def gateway_exit(exit=None):
+    return None
+
+
+def youtube_fallback_exits(player=None):
+    return ()
+

@@ -15,6 +15,8 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 
 from youtube import refs
+from scraper_utils.values import bool_or_none, num as to_float, to_int
+from scraper_utils.dates import iso_day as iso_date, iso_utc as iso_datetime
 
 __all__ = [
     "to_int", "to_float", "bool_or_none", "text", "clean", "count", "duration_seconds",
@@ -32,26 +34,6 @@ _NO_COUNT_RE = re.compile(r"^\s*(no|zero)\b", re.I)
 # ---- scalars --------------------------------------------------------------------------------
 # Kept local (not imported from another site's package) so the youtube
 # package stays self-contained.
-
-def to_int(value):
-    try:
-        return int(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return None
-
-
-def to_float(value):
-    try:
-        return float(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
-
-
-def bool_or_none(value):
-    return value if isinstance(value, bool) else None
 
 
 # ---- text ---------------------------------------------------------------------------------
@@ -176,28 +158,6 @@ def duration_text(seconds):
 # ---- dates ------------------------------------------------------------------------------------
 
 _MONTHS = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
-
-
-def iso_datetime(value):
-    """'2009-10-24T23:57:33-07:00' -> '2009-10-25T06:57:33Z' (UTC)."""
-    if not isinstance(value, str) or not value.strip():
-        return None
-    raw = value.strip().replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def iso_date(value):
-    """'2009-10-24T23:57:33-07:00' -> '2009-10-24' (the date as YouTube shows it, uploader-local)."""
-    if not isinstance(value, str):
-        return None
-    match = re.match(r"(\d{4}-\d{2}-\d{2})", value.strip())
-    return match.group(1) if match else None
 
 
 def iso_from_usec(value):

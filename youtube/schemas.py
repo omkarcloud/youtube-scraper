@@ -118,7 +118,8 @@ class SubtitlesSchema(BaseSchema):
 class TranscriptSchema(BaseSchema):
     video = VideoField()
     language = StrippedString(load_default=None, metadata={
-        "description": "subtitle track language code (en, es, pt-BR, ...); default: the video's main track"})
+        "description": "subtitle track language code (en, es, pt-BR, ...); default: the spoken language "
+                       "(the manual track in the auto-caption language, else the auto-captions)"})
     format = ChoiceField(["json", "text", "srt", "vtt"], load_default="json")
 
     @validates_schema

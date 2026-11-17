@@ -228,6 +228,37 @@ def test_captions_and_transcript():
     chosen, _ = P.base_caption_url(android)
     assert chosen["languageCode"] == "en"
     assert P.base_caption_url(android, "xx")[0] is None
+
+    def player(tracks, default_index=None, audio_tracks=None, default_audio=None):
+        renderer = {"captionTracks": [{"baseUrl": f"https://x/{i}", "languageCode": code, **({"kind": "asr"} if asr else {})}
+                                      for i, (code, asr) in enumerate(tracks)]}
+        if audio_tracks is not None:
+            renderer["audioTracks"] = audio_tracks
+            renderer["defaultAudioTrackIndex"] = default_audio
+        elif default_index is not None:
+            renderer["audioTracks"] = [{"captionTrackIndices": list(range(len(tracks))), "defaultCaptionTrackIndex": default_index}]
+        return {"captions": {"playerCaptionsTracklistRenderer": renderer}}
+
+    def chosen(*a, **kw):
+        t, _ = P.base_caption_url(player(*a, **kw))
+        return t["languageCode"], t.get("kind")
+
+    # Spanish video, English subtitles added: the viewer default (hl=en) says "en"; the asr track says "es".
+    assert chosen([("en", False), ("es", False), ("es", True)], default_index=0) == ("es", None)
+    # No track in the viewer's language: the viewer default falls on index 0 (Arabic); the asr track is Turkish.
+    assert chosen([("ar", False), ("tr", False), ("tr", True)], default_index=0) == ("tr", None)
+    # Spoken language with only an asr track (regional manual tracks do not match loosely... but same base does).
+    assert chosen([("ar", False), ("pt-BR", False), ("pt", True)], default_index=0) == ("pt-BR", None)
+    assert chosen([("ar", False), ("tr", True)], default_index=0) == ("tr", "asr")
+    # No asr track at all: the viewer default is the only signal left, then the first manual track.
+    assert chosen([("en", False), ("es", False)], default_index=1) == ("es", None)
+    assert chosen([("en", False), ("es", False)]) == ("en", None)
+    # Dubbed video: the original (default) audio track's asr wins over the dub's asr.
+    dubs = [{"captionTrackIndices": [0, 2], "defaultCaptionTrackIndex": 0}, {"captionTrackIndices": [1, 3], "defaultCaptionTrackIndex": 1}]
+    assert chosen([("en", False), ("hi", False), ("en", True), ("hi", True)], audio_tracks=dubs, default_audio=1) == ("hi", None)
+    assert chosen([("en", False), ("hi", False), ("en", True), ("hi", True)], audio_tracks=dubs, default_audio=0) == ("en", None)
+    # Explicit language still wins over everything.
+    assert P.base_caption_url(player([("ar", False), ("tr", True)]), "ar")[0]["languageCode"] == "ar"
     segments = P.json3_segments({"events": [{"tStartMs": 1360, "dDurationMs": 1680, "segs": [{"utf8": "[♪♪♪]"}]},
                                             {"tStartMs": 3000, "dDurationMs": 1000, "segs": [{"utf8": "\n"}]}]})
     assert segments == [{"start_seconds": 1.36, "end_seconds": 3.04, "duration_seconds": 1.68, "text": "[♪♪♪]"}]

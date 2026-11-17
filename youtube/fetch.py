@@ -29,9 +29,18 @@ Upstream surfaces:
                post's browse params need its channel id, the page does not
 
 Blocks: YouTube bot-checks the player from some cloud ranges ("Sign in to
-confirm you're not a bot") and may 403/429. On either, the worker thread's
-next session goes through a sticky residential exit
-(config.youtube_fallback_proxy()) for config.YOUTUBE_BLOCK_COOLDOWN seconds.
+confirm you're not a bot") and may 403/429. Since 2026-11-11 there are two
+lanes, each moving on its own refusals for config.YOUTUBE_BLOCK_COOLDOWN
+seconds (see "sessions" below):
+  * everything but the player: own IP -> the shared gateway
+    (config.YOUTUBE_FALLBACK_EXIT = "gateway", exit_gateway.py) -> a sticky
+    residential exit (config.YOUTUBE_FALLBACK_PROXY_COUNTRY) when the
+    gateway is refused too, or for the LAST retry of a call it keeps failing;
+  * the player (and the caption tracks it signs): own IP -> residential.
+    gateway addresses are bot-checked on the player, WEB and ANDROID alike
+    (2026-11-11 through the gateway: 12 of 18 player calls, every video
+    but one), so it has no gateway step.
+The numbers are in config.py's YouTube block.
 
 Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   YoutubeUpstreamError  transport failure / 5xx / unparseable body   — retryable
@@ -40,6 +49,7 @@ Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   YoutubeNotFound       InnerTube 404, or the entity is missing      — never retried
 """
 import json
+import fastjson
 import os
 import re
 import sys
@@ -50,7 +60,9 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+import egress
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
+from scraper_utils import debug, fanout, sessions as sessions_utils
 
 SITE = "https://www.youtube.com"
 CHARTS_SITE = "https://charts.youtube.com"
@@ -62,7 +74,7 @@ FANOUT_WORKERS = 8
 ANDROID_UA = "com.google.android.youtube/{v} (Linux; U; Android 11) gzip"
 BASE_HEADERS = {
     "accept": "*/*",
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": egress.site_accept_language("youtube"),
     "content-type": "application/json",
     "origin": SITE,
     "referer": SITE + "/",
@@ -92,74 +104,141 @@ class YoutubeBotCheck(YoutubeBlocked):
 
 
 # ---- sessions --------------------------------------------------------------------
+# One session per worker thread and lane (egress.new_session: curl_cffi, or
+# the gateway exit's look-alike). Two lanes since 2026-11-11, each with its
+# own block state, because the gateway exit carries everything BUT the player:
+#   API     search / browse / next / resolve_url / live_chat, charts, suggest
+#           and the pages: own IP -> the gateway exit -> residential
+#   PLAYER  the player call and the caption tracks it signs: own IP ->
+#           residential (gateway addresses get the bot check on the player,
+#           WEB and ANDROID; the numbers are in config.py)
+# A lane moves one step down for config.YOUTUBE_BLOCK_COOLDOWN seconds when
+# ITS exit is refused, then goes back to direct. Before, one bot-checked
+# player call sent every surface through the residential exit.
+API, PLAYER = "api", "player"
 _local = threading.local()
-_fallback_until = 0.0
+_fallback = {API: {"until": 0.0, "step": 1}, PLAYER: {"until": 0.0, "step": 1}}
 _fallback_lock = threading.Lock()
 
 
-def _proxy_for_new_session():
+def _exits(lane):
+    return config.youtube_fallback_exits(player=lane == PLAYER)
+
+
+def _gateway_step(lane, step):
+    """True when the lane's fallback step `step` is the gateway exit with
+    another exit configured behind it."""
+    exits = _exits(lane)
+    return 0 < step < len(exits) and bool(config.gateway_exit(exits[step - 1]))
+
+
+def _step(lane=API):
+    """The fallback step a session of `lane` built NOW rides: 0 = the
+    configured exit (the server's own IP), 1, 2 = the lane's fallback exits
+    while its cooldown runs; one step past the gateway for the last retry of
+    a call (_retrying)."""
+    state = _fallback[lane]
+    step = state["step"] if time.time() < state["until"] else 0
+    if getattr(_local, "past_gateway", None) == lane and _gateway_step(lane, step):
+        step += 1
+    return step
+
+
+def _proxy_for_new_session(lane=API, step=None):
     forced = config.youtube_proxy()
     if forced:
         return forced
-    if time.time() < _fallback_until:
-        return config.youtube_fallback_proxy()
-    return None
+    step = _step(lane) if step is None else step
+    return config.youtube_fallback_proxy(step, player=lane == PLAYER) if step else None
 
 
-def _session():
-    sess = getattr(_local, "session", None)
+def _sessions():
+    sessions = getattr(_local, "sessions", None)
+    if sessions is None:
+        sessions = _local.sessions = {}
+    return sessions
+
+
+def _session(lane=API):
+    sess = _sessions().get(lane)
+    step = _step(lane)
+    if sess is not None and getattr(sess, "_yt_step", 0) != step:
+        _drop_session(lane)          # a session follows its lane's step
+        sess = None
     if sess is None:
-        from curl_cffi import requests as curl_requests
-        sess = curl_requests.Session(impersonate=IMPERSONATE)
-        proxy = _proxy_for_new_session()
-        if proxy:
-            sess.proxies = {"http": proxy, "https": proxy}
-        _local.session = sess
+        # None (direct), a proxy URL, or the gateway exit ("gateway")
+        sess = egress.new_session(_proxy_for_new_session(lane, step), impersonate=IMPERSONATE)
+        sess._yt_step = step
+        _sessions()[lane] = sess
     return sess
 
 
-def _drop_session():
-    sess = getattr(_local, "session", None)
-    _local.session = None
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
+def _drop_session(lane=API):
+    sess = _sessions().pop(lane, None)
+    sessions_utils.close_quietly(sess)
 
 
-def _note_block():
-    """Refused or bot-checked on this egress: send new sessions through a
-    residential exit for a while (no-op when no fallback is configured)."""
-    global _fallback_until
-    if config.youtube_fallback_proxy() is not None:
-        with _fallback_lock:
-            _fallback_until = time.time() + config.YOUTUBE_BLOCK_COOLDOWN
+def _with_cookies(sess, headers, cookies):
+    """(headers, cookies) for one request on `sess`. A curl session takes
+    `cookies=` as it is. The gateway exit's session keeps cookies per target
+    host and sends them in a Cookie header of its own; a `cookies=` there is
+    set for the gateway's host and leaves as a second Cookie header, so on
+    it they go into the explicit header (which the session merges)."""
+    if cookies and getattr(sess, "via_exit_gateway", False):
+        return dict(headers or {}, cookie="; ".join(f"{k}={v}" for k, v in cookies.items())), None
+    return headers, cookies
+
+
+def _note_block(lane=API):
+    """The exit this thread's `lane` session rides was refused or
+    bot-checked: the lane's new sessions move one fallback step down for a
+    cooldown (on the last step they stay there, each on a fresh exit).
+    No-op when no fallback is configured, and for the exit past the gateway
+    that only a call's last retry borrowed (_retrying): the gateway step was
+    not the one refused, so the lane stays on it."""
+    exits = _exits(lane)
+    if not exits:
+        return
+    sess_step = getattr(_sessions().get(lane), "_yt_step", _step(lane))
+    state = _fallback[lane]
+    own = state["step"] if time.time() < state["until"] else 0
+    if getattr(_local, "past_gateway", None) == lane and _gateway_step(lane, own) and sess_step == own + 1:
+        return
+    step = min(sess_step + 1, len(exits))
+    with _fallback_lock:
+        if time.time() >= state["until"] or step > state["step"]:
+            state["step"] = step
+        state["until"] = time.time() + config.YOUTUBE_BLOCK_COOLDOWN
+    if config.gateway_exit(exits[0]):     # how often each step is refused is the number to watch
+        print(f"youtube: exit refused, {lane} sessions on fallback step {state['step']} "
+              f"({exits[state['step'] - 1]}) for {config.YOUTUBE_BLOCK_COOLDOWN} s")
 
 
 def dump_debug(name, text):
     """Keep the last body of each failure kind when YOUTUBE_DEBUG_DIR is set."""
-    dbg = os.environ.get("YOUTUBE_DEBUG_DIR", "")
-    if dbg and text:
-        try:
-            os.makedirs(dbg, exist_ok=True)
-            with open(os.path.join(dbg, name + ".txt"), "w") as f:
-                f.write(text if isinstance(text, str) else json.dumps(text, ensure_ascii=False))
-        except OSError:
-            pass
+    debug.dump("YOUTUBE_DEBUG_DIR", name, text, render=lambda body: json.dumps(body, ensure_ascii=False))
 
 
-def _retrying(fn):
+def _retrying(fn, lane=API):
+    """Run fn() under the shared retry policy, each retry on a fresh session
+    / exit. While the lane is on the gateway exit step the LAST retry of a
+    call rides the next step (the residential exit), for that call only: a
+    gateway failure then costs latency, not the call."""
     last = None
-    for attempt in range(1, config.MAX_RETRIES + 1):
-        try:
-            return fn()
-        except YoutubeUpstreamError as e:        # includes YoutubeBlocked
-            last = e
-            _drop_session()
-        if attempt < config.MAX_RETRIES:
-            time.sleep(config.RETRY_BACKOFF * attempt)
-    raise last
+    _local.past_gateway = None
+    try:
+        for attempt in range(1, config.MAX_RETRIES + 1):
+            try:
+                return fn()
+            except YoutubeUpstreamError as e:        # includes YoutubeBlocked
+                last = e
+                _drop_session(lane)
+            if attempt < config.MAX_RETRIES:
+                _local.past_gateway = lane if attempt + 1 == config.MAX_RETRIES else None    # read by _step() for the session built next
+                time.sleep(config.RETRY_BACKOFF * attempt)
+        raise last
+    finally:
+        _local.past_gateway = None      # _session() rebuilds on the lane's own step for the next call
 
 
 # ---- client config (WEB version + key, refreshed from the homepage) -------------------
@@ -181,8 +260,9 @@ def client_config():
             return _client
         _client["at"] = now      # one attempt per period even when it fails
         try:
-            resp = _session().get(SITE + "/?hl=en&gl=US", headers={"accept-language": "en-US,en;q=0.9"},
-                                  cookies=PAGE_COOKIES, timeout=TIMEOUT)
+            sess = _session()
+            headers, cookies = _with_cookies(sess, {"accept-language": egress.site_accept_language("youtube")}, PAGE_COOKIES)
+            resp = sess.get(SITE + "/?hl=en&gl=US", headers=headers, cookies=cookies, timeout=TIMEOUT)
             if resp.status_code == 200:
                 key = _KEY_RE.search(resp.text or "")
                 version = _VERSION_RE.search(resp.text or "")
@@ -229,9 +309,9 @@ def _error_message(resp):
     return None
 
 
-def _post_json(url, payload, headers, label):
+def _post_json(url, payload, headers, label, lane=API):
     def once():
-        sess = _session()
+        sess = _session(lane)
         try:
             resp = sess.post(url, headers=headers, data=json.dumps(payload), timeout=TIMEOUT)
         except Exception as e:
@@ -239,7 +319,7 @@ def _post_json(url, payload, headers, label):
         status = resp.status_code
         if status in (403, 429):
             dump_debug("blocked", resp.text)
-            _note_block()
+            _note_block(lane)
             raise YoutubeBlocked(f"HTTP {status} on {label}")
         if status == 404:
             raise YoutubeNotFound(_error_message(resp) or f"{label}: not found")
@@ -251,22 +331,23 @@ def _post_json(url, payload, headers, label):
         body = resp.text or ""
         if not body.lstrip().startswith("{"):
             dump_debug("nonjson", body)
-            _note_block()
+            _note_block(lane)
             raise YoutubeBlocked(f"{label} returned HTML, not JSON")
         try:
             return resp.json()
         except Exception:
             dump_debug("badjson", body)
             raise YoutubeUpstreamError(f"could not parse JSON from {label}")
-    return _retrying(once)
+    return _retrying(once, lane)
 
 
 def innertube(endpoint, body, *, client="WEB", hl="en", gl="US"):
-    """POST one InnerTube call -> the parsed JSON dict."""
+    """POST one InnerTube call -> the parsed JSON dict. The player rides
+    its own lane (PLAYER: no gateway exit step), everything else API."""
     payload = dict(body)
     payload["context"] = _context(client, hl, gl)
     url = f"{SITE}/youtubei/v1/{endpoint}?prettyPrint=false&key={client_config()['key']}"
-    return _post_json(url, payload, _headers(client), endpoint)
+    return _post_json(url, payload, _headers(client), endpoint, lane=PLAYER if endpoint == "player" else API)
 
 
 _BOT_RE = re.compile(r"not a bot|confirm you.re not|unusual traffic", re.I)
@@ -282,7 +363,7 @@ def player(video_id, *, client="WEB", hl="en", gl="US"):
         reason = " ".join(str(status.get(k) or "") for k in ("reason", "status"))
         if _BOT_RE.search(reason):
             dump_debug("botcheck", data)
-            _note_block()
+            _note_block(PLAYER)
             raise YoutubeBotCheck(f"player bot check for {video_id}")
         return data
     last = None
@@ -291,7 +372,7 @@ def player(video_id, *, client="WEB", hl="en", gl="US"):
             return once()
         except YoutubeBotCheck as e:      # transport errors already retried inside innertube()
             last = e
-            _drop_session()
+            _drop_session(PLAYER)
         if attempt < config.MAX_RETRIES:
             time.sleep(config.RETRY_BACKOFF * attempt)
     raise last
@@ -310,26 +391,26 @@ def charts(query, *, hl="en", gl="US"):
     return _post_json(url, payload, headers, "charts")
 
 
-def _get_text(url, *, params=None, headers=None, label="page", cookies=None, retry=True):
+def _get_text(url, *, params=None, headers=None, label="page", cookies=None, retry=True, lane=API):
     def once():
-        sess = _session()
+        sess = _session(lane)
+        head, jar = _with_cookies(sess, headers or {"accept-language": egress.site_accept_language("youtube")}, cookies)
         try:
-            resp = sess.get(url, params=params, headers=headers or {"accept-language": "en-US,en;q=0.9"},
-                            cookies=cookies, timeout=TIMEOUT)
+            resp = sess.get(url, params=params, headers=head, cookies=jar, timeout=TIMEOUT)
         except Exception as e:
             raise YoutubeUpstreamError(f"request failed: {type(e).__name__}: {e}")
         status = resp.status_code
         if status in (403, 429):
             dump_debug("blocked", resp.text)
             if retry:
-                _note_block()
+                _note_block(lane)
             raise YoutubeBlocked(f"HTTP {status} on {label}")
         if status == 404:
             raise YoutubeNotFound(f"{label}: not found")
         if status != 200:
             raise YoutubeUpstreamError(f"HTTP {status} on {label}")
         return resp.text or ""
-    return _retrying(once) if retry else once()
+    return _retrying(once, lane) if retry else once()
 
 
 def suggest(query, *, hl="en", gl="US"):
@@ -341,7 +422,7 @@ def suggest(query, *, hl="en", gl="US"):
     if start < 0 or end <= start:
         raise YoutubeUpstreamError("suggest returned an unexpected body")
     try:
-        return json.loads(text[start + 1:end])
+        return fastjson.loads(text[start + 1:end])
     except ValueError:
         raise YoutubeUpstreamError("could not parse the suggest answer")
 
@@ -349,8 +430,9 @@ def suggest(query, *, hl="en", gl="US"):
 def timedtext(url, *, retry=True):
     """A caption track body (json3 / vtt / ...). retry=False for token-gated
     (translated) tracks, where a 429 means 'token refused', not 'this exit
-    is blocked'."""
-    return _get_text(url, label="timedtext", retry=retry)
+    is blocked'. The track link is signed by the player answer, so it
+    rides the player's lane (the exit that answered the player call)."""
+    return _get_text(url, label="timedtext", retry=retry, lane=PLAYER)
 
 
 def page_initial_data(path, *, hl="en", gl="US"):
@@ -392,7 +474,7 @@ def extract_json_var(text, name):
             depth -= 1
             if depth == 0:
                 try:
-                    return json.loads(text[start:pos + 1])
+                    return fastjson.loads(text[start:pos + 1])
                 except ValueError:
                     return None
     return None
@@ -402,13 +484,7 @@ def extract_json_var(text, name):
 
 def run_parallel(fns):
     """Run callables concurrently -> results in order (exceptions propagate)."""
-    if not fns:
-        return []
-    if len(fns) == 1:
-        return [fns[0]()]
-    with ThreadPoolExecutor(max_workers=min(FANOUT_WORKERS, len(fns))) as ex:
-        futures = [ex.submit(fn) for fn in fns]
-        return [f.result() for f in futures]
+    return fanout.per_call(fns, FANOUT_WORKERS)
 
 
 def run_parallel_safe(fns):

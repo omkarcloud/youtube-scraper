@@ -316,11 +316,23 @@ def caption_link(base_url, fmt):
 def base_caption_url(android_player, language_code=None):
     """(chosen track, any track) for a transcript. With `language_code`: that
     language, manual before auto-generated (chosen is None when the video has
-    no such track). Without: the video's own language — the manual track in
-    the auto-generated track's language, else that auto-generated track,
-    else the first manual track."""
+    no such track). Without: the video's spoken language — the manual track
+    in the auto-generated track's language, else that auto-generated track;
+    only when the video has no auto-generated track, the player's default
+    track, else the first manual track.
+
+    The auto-generated (asr) track is the spoken-language signal: YouTube
+    produces it in the language it hears. The player's
+    `defaultCaptionTrackIndex` is NOT one — it is the track the player would
+    switch on for THIS viewer (hl=en here), so it lands on the English
+    subtitles of a Spanish song, and on index 0 (tracks are sorted by name,
+    so usually Arabic) when the video has no track in the viewer's language.
+    Trusting it first was the 2026-10 "transcript comes back in Arabic" bug.
+    On a multi-audio video (dubs) only the default audio track's captions
+    are considered, so a dubbed track's asr does not win."""
     renderer = V.find_key(android_player, "captions", "playerCaptionsTracklistRenderer") or {}
-    tracks = [t for t in renderer.get("captionTracks") or [] if isinstance(t, dict) and t.get("baseUrl")]
+    all_tracks = renderer.get("captionTracks") or []
+    tracks = [t for t in all_tracks if isinstance(t, dict) and t.get("baseUrl")]
     if not tracks:
         return None, None
 
@@ -340,15 +352,28 @@ def base_caption_url(android_player, language_code=None):
             if exact or loose:
                 return (exact or loose)[0], tracks[0]
         return None, tracks[0]
-    default_index = V.find_key(renderer, "audioTracks", 0, "defaultCaptionTrackIndex")
-    if isinstance(default_index, int) and 0 <= default_index < len(renderer.get("captionTracks") or []):
-        track = renderer["captionTracks"][default_index]
-        if isinstance(track, dict) and track.get("baseUrl"):
-            return track, tracks[0]
+
+    audio_tracks = renderer.get("audioTracks") or []
+    audio_index = renderer.get("defaultAudioTrackIndex")
+    audio = audio_tracks[audio_index] if isinstance(audio_index, int) and 0 <= audio_index < len(audio_tracks) else (audio_tracks[0] if audio_tracks else {})
+    if isinstance(audio, dict) and isinstance(audio.get("captionTrackIndices"), list):
+        own = [all_tracks[i] for i in audio["captionTrackIndices"]
+               if isinstance(i, int) and 0 <= i < len(all_tracks) and isinstance(all_tracks[i], dict) and all_tracks[i].get("baseUrl")]
+        if own:
+            # Only the default audio track's captions: a dub's asr (or its
+            # manual track) must not stand in for the original's.
+            manual = [t for t in own if t.get("kind") != "asr"]
+            auto = [t for t in own if t.get("kind") == "asr"]
     if auto:
         spoken = lang(auto[0])
-        match = [t for t in manual if same(lang(t), spoken)]
-        return (match[0] if match else auto[0]), tracks[0]
+        exact = [t for t in manual if lang(t) == spoken]
+        loose = [t for t in manual if same(lang(t), spoken)]
+        return (exact or loose or auto)[0], tracks[0]
+    default_index = audio.get("defaultCaptionTrackIndex") if isinstance(audio, dict) else None
+    if isinstance(default_index, int) and 0 <= default_index < len(all_tracks):
+        track = all_tracks[default_index]
+        if isinstance(track, dict) and track.get("baseUrl"):
+            return track, tracks[0]
     return manual[0], tracks[0]
 
 

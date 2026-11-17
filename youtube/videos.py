@@ -2,7 +2,7 @@
 stream formats + storyboards, comments and replies, related videos,
 subtitle tracks, transcript and live chat. Every function takes the
 resolved 11-character `video` id."""
-import json
+import fastjson
 
 from youtube import items as I
 from youtube import protos
@@ -156,7 +156,7 @@ def subtitles(video):
 def _timedtext_json(link):
     body = timedtext(link)
     try:
-        return json.loads(body) if body and body.strip() else {}
+        return fastjson.loads(body) if body and body.strip() else {}
     except ValueError:
         raise YoutubeUpstreamError("timedtext returned an unparseable body")
 
